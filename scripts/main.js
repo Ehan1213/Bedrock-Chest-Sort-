@@ -16,12 +16,20 @@ import {
   world,
   system,
   BlockComponentTypes,
-  ItemStack,
 } from "@minecraft/server";
 
 const INV_ID = BlockComponentTypes.Inventory; // "minecraft:inventory"
-const VERBOSE = true; // flip to false once you trust it
-const log = (p, msg, c = "7") => VERBOSE && p.sendMessage(`§${c}${msg}`);
+const VERBOSE = false; // flip to false once you trust it
+const DEBUG_KEYS = false; // logs merge-key diagnostics and skips writes
+const CREATOR_TOOLS_LOGGING = false; // writes logs to console for Creator Tools
+const log = (p, msg, c = "7") => {
+  if (VERBOSE) p.sendMessage(`§${c}${msg}`);
+  creatorToolsLog("info", msg);
+};
+const debugKeyLog = (p, msg, c = "8") => {
+  if (DEBUG_KEYS) p.sendMessage(`§${c}${msg}`);
+  if (DEBUG_KEYS) creatorToolsLog("debug", msg);
+};
 
 // ───────── Event hook ────────────────────────────────────────────────────────
 world.beforeEvents.playerInteractWithBlock.subscribe((ev) => {
@@ -52,6 +60,7 @@ function sortContainer(player, clickedBlock) {
   for (let slot = 0; slot < before.length; slot++) {
     const stk = before[slot];
     if (!stk) continue;
+    const oldKey = getLegacyItemKey(stk);
     const key = getItemKey(stk);
     if (VERBOSE) {
       const componentIds = getComponentIds(stk).join(", ") || "none";
@@ -62,9 +71,48 @@ function sortContainer(player, clickedBlock) {
       );
       log(player, `[merge] slot=${slot} components=${componentIds}`, "8");
     }
-    if (!merged.has(key))
-      merged.set(key, { proto: stk.clone(), qty: 0, max: stk.maxAmount });
-    merged.get(key).qty += stk.amount;
+    if (!merged.has(key)) {
+      merged.set(key, {
+        proto: stk.clone(),
+        qty: 0,
+        max: stk.maxAmount,
+        members: DEBUG_KEYS ? [] : undefined,
+      });
+    }
+    const entry = merged.get(key);
+    entry.qty += stk.amount;
+    if (DEBUG_KEYS) {
+      const details = getItemIdentityDetails(stk);
+      entry.members.push({
+        slot,
+        amount: stk.amount,
+        oldKey,
+        newKey: key,
+        details,
+      });
+      debugKeyLog(
+        player,
+        `[key] slot=${slot} ${oldKey} -> ${key} mergedQty=${entry.qty}`
+      );
+      if (details.bookProbe) {
+        debugKeyLog(
+          player,
+          `[book] slot=${slot} probe=${stableStringify(details.bookProbe)}`
+        );
+      }
+      if (entry.members.length > 1) {
+        const previous = entry.members[0];
+        debugKeyLog(
+          player,
+          `[equal] slot=${slot} matched slot=${previous.slot} because ${explainKeyEquality(previous.details, details)}`
+        );
+      }
+    }
+  }
+
+  if (DEBUG_KEYS) {
+    debugKeyLog(player, `[dry-run] computed ${merged.size} merged groups; no container changes written`, "6");
+    return;
   }
 
   // Produce alphabetically sorted array of stacks, split by max stack size
@@ -81,9 +129,13 @@ function sortContainer(player, clickedBlock) {
   });
   while (final.length < size) final.push(null);
 
+  if (hasSameLayout(before, final)) {
+    log(player, "§7Container already sorted");
+    return;
+  }
+
   // Write new order
-  cont.clearAll();
-  final.forEach((stk, i) => stk && cont.setItem(i, stk));
+  writeSnapshot(cont, final);
 
   // Verify counts (ignore slot order)
   const after = snapshot(cont);
@@ -92,8 +144,7 @@ function sortContainer(player, clickedBlock) {
   if (diffMsg) {
     log(player, `§c❌ Sorting failed – ${diffMsg}`);
     // Roll back
-    cont.clearAll();
-    before.forEach((stk, i) => stk && cont.setItem(i, stk));
+    writeSnapshot(cont, before);
   } else {
     log(player, "§aChest sorted!");
   }
@@ -106,19 +157,85 @@ function snapshot(container) {
   );
 }
 
+function writeSnapshot(container, items) {
+  container.clearAll();
+  items.forEach((stk, i) => stk && container.setItem(i, stk));
+}
+
+function hasSameLayout(before, after) {
+  if (before.length !== after.length) return false;
+
+  for (let i = 0; i < before.length; i++) {
+    if (!isSameStack(before[i], after[i])) return false;
+  }
+
+  return true;
+}
+
+function isSameStack(left, right) {
+  if (!left && !right) return true;
+  if (!left || !right) return false;
+
+  return left.amount === right.amount && getItemKey(left) === getItemKey(right);
+}
+
 function getItemKey(stk) {
   const parts = [`${stk.typeId}:${stk.data ?? 0}`];
   const nameTag = typeof stk.nameTag === "string" ? stk.nameTag : "";
   const lore = safeGetLore(stk);
   const enchantments = getEnchantmentsSignature(stk);
+  const book = getBookSignature(stk);
   const componentState = getInterestingComponentState(stk);
 
   if (nameTag) parts.push(`name=${stableStringify(nameTag)}`);
   if (lore.length) parts.push(`lore=${stableStringify(lore)}`);
   if (enchantments) parts.push(`ench=${enchantments}`);
+  if (book) parts.push(`book=${book}`);
   if (componentState) parts.push(`cmp=${componentState}`);
 
   return parts.join("|");
+}
+
+function getLegacyItemKey(stk) {
+  return `${stk.typeId}:${stk.data ?? 0}`;
+}
+
+function getItemIdentityDetails(stk) {
+  const bookProbe = getBookDebugProbe(stk);
+
+  return {
+    typeId: stk.typeId,
+    data: stk.data ?? 0,
+    nameTag: typeof stk.nameTag === "string" ? stk.nameTag : "",
+    lore: safeGetLore(stk),
+    enchantments: getEnchantmentsSignature(stk),
+    book: getBookSignature(stk),
+    bookProbe,
+    componentState: getInterestingComponentState(stk),
+    componentIds: getComponentIds(stk),
+  };
+}
+
+function explainKeyEquality(left, right) {
+  const reasons = [];
+
+  if (left.typeId === right.typeId) reasons.push(`typeId=${left.typeId}`);
+  if (left.data === right.data) reasons.push(`data=${left.data}`);
+  if (left.nameTag === right.nameTag && left.nameTag)
+    reasons.push(`name=${stableStringify(left.nameTag)}`);
+  if (stableStringify(left.lore) === stableStringify(right.lore) && left.lore.length)
+    reasons.push(`lore=${stableStringify(left.lore)}`);
+  if (left.enchantments === right.enchantments && left.enchantments)
+    reasons.push(`ench=${left.enchantments}`);
+  if (left.book === right.book && left.book)
+    reasons.push(`book=${left.book}`);
+  if (left.componentState === right.componentState && left.componentState)
+    reasons.push(`cmp=${left.componentState}`);
+
+  const leftExtra = left.componentIds.filter((id) => right.componentIds.includes(id));
+  if (leftExtra.length) reasons.push(`sharedComponents=${leftExtra.join("/")}`);
+
+  return reasons.length > 0 ? reasons.join("; ") : "their computed metadata signature was identical";
 }
 
 function safeGetLore(stk) {
@@ -179,13 +296,76 @@ function getEnchantmentsSignature(stk) {
   }
 }
 
+function getBookSignature(stk) {
+  const component = getFirstComponent(stk, ["minecraft:book"]);
+  if (!component) return "";
+
+  try {
+    const pageCount = readComponentValue(component, ["pageCount", "getPageCount"]);
+    const signature = {
+      title: readComponentValue(component, ["title", "getTitle"]),
+      author: readComponentValue(component, ["author", "getAuthor"]),
+      pages: getBookPages(component, pageCount),
+      pageCount,
+      generation: readComponentValue(component, ["generation", "getGeneration"]),
+      resolved: readComponentValue(component, ["resolved", "isResolved"]),
+    };
+
+    const normalized = normalizeValue(signature);
+    return normalized ? JSON.stringify(normalized) : "";
+  } catch {
+    return "";
+  }
+}
+
+function getBookDebugProbe(stk) {
+  if (!DEBUG_KEYS) return undefined;
+
+  const component = getFirstComponent(stk, ["minecraft:book"]);
+  if (!component) return undefined;
+
+  const proto = Object.getPrototypeOf(component);
+  const protoMethods = proto ? Object.getOwnPropertyNames(proto).sort() : [];
+  const sampled = {};
+
+  for (const name of protoMethods) {
+    if (
+      name === "constructor" ||
+      !/(author|title|page|text|content|message|book)/i.test(name)
+    ) {
+      continue;
+    }
+
+    const result = readComponentValue(component, [name]);
+    if (result !== undefined) sampled[name] = result;
+  }
+
+  const ownKeys = {};
+  for (const key of Object.keys(component).sort()) {
+    if (typeof component[key] === "function") continue;
+    const result = normalizeValue(component[key]);
+    if (result !== undefined) ownKeys[key] = result;
+  }
+
+  const probe = normalizeValue({
+    ownKeys,
+    protoMethods,
+    sampled,
+  });
+
+  return probe && (Object.keys(probe.ownKeys ?? {}).length > 0 || Object.keys(probe.sampled ?? {}).length > 0)
+    ? probe
+    : undefined;
+}
+
 function getInterestingComponentState(stk) {
   const states = [];
 
   for (const component of stk.getComponents?.() ?? []) {
     if (
       component.typeId === "minecraft:enchantable" ||
-      component.typeId === "minecraft:enchantments"
+      component.typeId === "minecraft:enchantments" ||
+      component.typeId === "minecraft:book"
     ) {
       continue;
     }
@@ -215,6 +395,74 @@ function getFirstComponent(stk, componentIds) {
     }
   }
   return null;
+}
+
+function readComponentValue(component, names) {
+  for (const name of names) {
+    try {
+      const value = component[name];
+      if (typeof value === "function") {
+        const result = value.call(component);
+        if (result !== undefined) return normalizeValue(result);
+        continue;
+      }
+      if (value !== undefined) return normalizeValue(value);
+    } catch {
+      // Keep probing alternate members.
+    }
+  }
+  return undefined;
+}
+
+function getBookPages(component, pageCount) {
+  const direct = readComponentValue(component, [
+    "pages",
+    "getPages",
+    "text",
+    "getText",
+    "content",
+    "getContent",
+    "contents",
+    "getContents",
+    "messages",
+    "getMessages",
+  ]);
+  if (direct !== undefined) return direct;
+
+  const indexed = getIndexedBookPages(component, pageCount, [
+    "getPage",
+    "getPageContent",
+    "getRawPageContent",
+  ], 0);
+  if (indexed !== undefined) return indexed;
+
+  return getIndexedBookPages(component, pageCount, [
+    "getPage",
+    "getPageContent",
+    "getRawPageContent",
+  ], 1);
+}
+
+function getIndexedBookPages(component, pageCount, methodNames, startIndex) {
+  if (!Number.isInteger(pageCount) || pageCount <= 0) return undefined;
+
+  const getPageMethod = methodNames.find(
+    (methodName) => typeof component[methodName] === "function"
+  );
+  if (!getPageMethod) return undefined;
+
+  const pages = [];
+  for (let offset = 0; offset < pageCount; offset++) {
+    try {
+      pages.push(
+        normalizeValue(component[getPageMethod](startIndex + offset))
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
+  return pages.some((page) => page !== undefined) ? pages : undefined;
 }
 
 function normalizeValue(value) {
@@ -262,4 +510,23 @@ function compareCounts(before, after) {
   return problems
     .map(([k, v]) => `${k} net ${v > 0 ? "+" : ""}${v}`)
     .join(", ");
+}
+
+function creatorToolsLog(level, msg) {
+  if (!CREATOR_TOOLS_LOGGING) return;
+
+  const line = `[ChestSorter:${level}] ${stripFormatting(msg)}`;
+  if (level === "error") {
+    console.error(line);
+    return;
+  }
+  if (level === "debug") {
+    console.warn(line);
+    return;
+  }
+  console.log(line);
+}
+
+function stripFormatting(msg) {
+  return String(msg).replace(/§[0-9A-FK-OR]/gi, "");
 }

@@ -11,8 +11,10 @@ Sneak + click any container (chest, barrel, etc.) to instantly alphabetize and s
 
 - ✅ Works in **singleplayer**, **multiplayer**, and **dedicated server (BDS)**
 - ✅ **Stacks up to each item’s actual max stack size**
-- ✅ **Alphabetical sorting** by item type ID
+- ✅ **Alphabetical sorting** by metadata-aware item key
 - ✅ **Safe rollback** if any item gets lost
+- ✅ Preserves **written books**, **enchanted items**, custom names, lore, and other readable item metadata
+- ✅ Optional **dry-run diagnostics** for Creator Tools / chat debugging
 - ✅ Fully written in JavaScript using `@minecraft/server` v2.0.0
 - ✅ Supports all vanilla containers with inventories
 
@@ -22,13 +24,14 @@ Sneak + click any container (chest, barrel, etc.) to instantly alphabetize and s
 
 - Sneak + interact with a container
 - The mod:
-  - Cancels the default GUI
   - Clones and tallies all items
-  - Merges and stacks by item ID and damage
+  - Builds a metadata-aware key for each item
+  - Merges only items with identical keys
   - Sorts alphabetically
   - Writes the result back the next tick
+  - Skips rewriting containers that are already sorted
   - Verifies **total item count matches** original
-  - If mismatch, reverts and logs the issue in chat
+  - If mismatch, reverts and logs the issue in chat or Creator Tools
 
 ---
 
